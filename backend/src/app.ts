@@ -3,15 +3,19 @@ import cors from "cors";
 import helmet from "helmet";
 import { createApiRouter } from "./routes";
 import { createAdminRouter } from "./routes/admin";
+import { createWalletRoleRouter } from "./routes/walletRole";
+import { createMaintenanceStatusRouter } from "./routes/maintenance";
 import { errorHandler } from "./middleware/errorHandler";
 import { requestLogger } from "./middleware/logger";
 import { requestContextMiddleware } from "./middleware/requestContext";
 import { metricsMiddleware } from "./middleware/metrics";
+import { maintenanceGuard } from "./middleware/maintenance";
 import {
   ApiKeyAuthProvider,
   requireAdmin,
   requireAuth,
 } from "./middleware/auth";
+import { MaintenanceService } from "./services/maintenanceService";
 import { PayoutsController } from "./controllers/payouts.controller";
 import { WorkerController } from "./controllers/worker.controller";
 import { AdminController } from "./controllers/admin.controller";
@@ -76,10 +80,31 @@ export function createApp(deps: AppDependencies): express.Application {
     origin: allowedOrigins.length > 0 ? allowedOrigins : undefined,
     credentials: true,
   }));
+  // Oracle webhook (#1127): enforce a strict body size cap before the default
+  // JSON parser buffers the payload. Mounted ahead of the global parser so
+  // oversized webhook bodies are rejected with 413 at the network layer
+  // instead of being accumulated in memory.
+  // `verify` stashes the exact bytes express-body-parser read off the wire
+  // onto req.rawBody, before JSON.parse touches them — verifyWebhookSignature
+  // HMACs that instead of JSON.stringify(req.body), since re-serializing an
+  // already-parsed object is not guaranteed to reproduce the sender's exact
+  // byte sequence (number formatting, key order, whitespace).
+  app.use(
+    "/api/oracle",
+    express.json({
+      limit: "4kb",
+      verify: (req, _res, buf) => {
+        (req as express.Request).rawBody = Buffer.from(buf);
+      },
+    }),
+  );
   app.use(express.json());
   app.use(requestLogger);
   app.use(requestContextMiddleware);
   app.use(metricsMiddleware);
+
+  const maintenanceService = new MaintenanceService();
+  app.use(maintenanceGuard(maintenanceService));
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
@@ -127,6 +152,7 @@ export function createApp(deps: AppDependencies): express.Application {
     deps.adminService,
     deps.paymentService,
     deps.transactions,
+    maintenanceService,
   );
   const authController = new AuthController(deps.authService);
   const usersController = new UsersController(prisma);
@@ -151,10 +177,12 @@ export function createApp(deps: AppDependencies): express.Application {
       deps.authService,
     ),
   );
+  app.use("/api/admin", createWalletRoleRouter());
   app.use(
     "/api/admin",
     createAdminRouter(adminController, roundController, adminAuthMiddleware),
   );
+  app.use("/api", createMaintenanceStatusRouter(maintenanceService));
 
   app.use(errorHandler);
 

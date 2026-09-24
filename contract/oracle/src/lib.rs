@@ -19,6 +19,7 @@ const KEY_MAX_RATE: soroban_sdk::Symbol = symbol_short!("MAX_RATE");
 const KEY_PENDING_ADMIN: soroban_sdk::Symbol = symbol_short!("P_ADMIN");
 
 pub const DEFAULT_MAX_YIELD_BPS: u32 = 5_000;
+pub const MAX_MAX_RATE_BPS: u32 = 10_000;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -74,6 +75,9 @@ impl OracleContract {
             .persistent()
             .get(&KEY_ADMIN)
             .ok_or(OracleError::NotInitialized)?;
+        if max_rate_bps > MAX_MAX_RATE_BPS {
+            return Err(OracleError::RateTooHigh);
+        }
         admin.require_auth();
         env.storage().persistent().set(&KEY_MAX_RATE, &max_rate_bps);
         env.events()
@@ -146,8 +150,7 @@ mod tests {
         env.mock_all_auths();
         let contract_id = env.register(OracleContract, ());
         let admin = Address::generate(&env);
-        let env_s: &'static Env = unsafe { &*(&env as *const Env) };
-        let client = OracleContractClient::new(env_s, &contract_id);
+        let client = OracleContractClient::new(&env, &contract_id);
         client.initialize(&admin, &initial_rate);
         (env, client)
     }
@@ -236,8 +239,7 @@ mod tests {
         env.mock_all_auths();
         let contract_id = env.register(OracleContract, ());
         let admin = Address::generate(&env);
-        let env_s: &'static Env = unsafe { &*(&env as *const Env) };
-        let client = OracleContractClient::new(env_s, &contract_id);
+        let client = OracleContractClient::new(&env, &contract_id);
         assert_eq!(
             client.try_initialize(&admin, &(DEFAULT_MAX_YIELD_BPS + 1)),
             Err(Ok(OracleError::RateTooHigh))
@@ -274,6 +276,58 @@ mod tests {
         assert_eq!(
             client.try_accept_admin(),
             Err(Ok(OracleError::NoPendingAdmin))
+        );
+    }
+
+    #[test]
+    fn set_max_rate_above_hard_ceiling_returns_rate_too_high() {
+        let (_env, client) = setup(500);
+        assert_eq!(
+            client.try_set_max_rate(&(MAX_MAX_RATE_BPS + 1)),
+            Err(Ok(OracleError::RateTooHigh))
+        );
+        assert_eq!(client.get_max_yield_bps(), DEFAULT_MAX_YIELD_BPS);
+    }
+
+    #[test]
+    fn set_max_rate_at_hard_ceiling_is_accepted() {
+        let (_env, client) = setup(500);
+        client.set_max_rate(&MAX_MAX_RATE_BPS);
+        assert_eq!(client.get_max_yield_bps(), MAX_MAX_RATE_BPS);
+    }
+
+    // ── Coverage added for issue #1144 ────────────────────────────────────
+
+    #[test]
+    fn set_yield_bps_before_initialize_returns_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(OracleContract, ());
+        let client = OracleContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_set_yield_bps(&500),
+            Err(Ok(OracleError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn set_yield_bps_without_admin_auth_is_rejected() {
+        let (env, client) = setup(500);
+
+        // Drop mocked auths so the admin's signature is genuinely required;
+        // a non-admin caller cannot supply it.
+        env.set_auths(&[]);
+
+        let result = client.try_set_yield_bps(&600);
+        assert!(
+            result.is_err(),
+            "set_yield_bps without the admin's authorization must be rejected"
+        );
+        assert_eq!(
+            client.get_current_yield_bps(),
+            500,
+            "rate must be unchanged after a rejected call"
         );
     }
 }

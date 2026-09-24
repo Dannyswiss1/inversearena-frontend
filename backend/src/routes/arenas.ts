@@ -10,8 +10,13 @@ import type { CreateArenaInput } from "../types/arena";
 import { ArenaService } from "../services/arenaService";
 import { ArenaStatsService } from "../services/arenaStatsService";
 import { RoundRepository } from "../repositories/roundRepository";
+import { ParticipantEligibilityService } from "../services/participantEligibilityService";
 import { apiError } from "../utils/apiError";
 import type { ArenaParticipant } from "../types/arena";
+import { getOnChainPlayers } from "../services/onChainReader";
+import { isAuthorizedAdminWallet } from "../services/walletRoleService";
+import { createRateLimitMiddleware, getSyncPlayersRateLimitConfig } from "../middleware/rateLimit";
+import { createSseConnectionLimitMiddleware } from "../middleware/sseConnectionLimit";
 
 const PaginationSchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(25),
@@ -117,6 +122,8 @@ export function createArenasRouter(authMiddleware: RequestHandler): Router {
   const arenaService = new ArenaService(prisma);
   const arenaStatsService = new ArenaStatsService(prisma);
   const roundRepository = new RoundRepository(prisma);
+  const eligibilityService = new ParticipantEligibilityService(prisma);
+  const sseConnectionLimiter = createSseConnectionLimitMiddleware();
 
   /**
    * POST /api/arenas
@@ -265,7 +272,10 @@ export function createArenasRouter(authMiddleware: RequestHandler): Router {
         return {
           id: `${latestRound?.id ?? id}:${choice.userId}:${index}`,
           walletAddress: user?.walletAddress ?? choice.userId,
-          choice: choice.choice,
+          // Hide the pick while the round is still open — otherwise any
+          // caller could see how others voted and choose accordingly,
+          // breaking the minority-wins fairness guarantee (#1212).
+          choice: latestRound?.state === "OPEN" ? null : choice.choice,
           stake: choice.stake,
           status,
           roundNumber: latestRound?.roundNumber ?? 0,
@@ -287,6 +297,44 @@ export function createArenasRouter(authMiddleware: RequestHandler): Router {
   );
 
   /**
+   * POST /api/arenas/:id/eligibility-preflight
+   * Verify participant eligibility before join transaction construction.
+   * Reports capacity, phase, balance, token, and duplicate-membership failures.
+   */
+  router.post(
+    "/:id/eligibility-preflight",
+    authMiddleware,
+    asyncHandler(async (req, res) => {
+      const { id } = req.params;
+      const { balance, balanceAsset } = z
+        .object({
+          balance: z.number().positive(),
+          balanceAsset: z.enum(["USDC", "XLM", "EURC"]).default("USDC"),
+        })
+        .parse(req.body);
+
+      if (!id) {
+        throw apiError(400, "INVALID_ARENA_ID", "Arena ID is required");
+      }
+
+      const playerWallet = req.user?.walletAddress;
+      if (!playerWallet) {
+        throw apiError(401, "UNAUTHORIZED", "Wallet address required");
+      }
+
+      const eligibility = await eligibilityService.checkEligibility(id, playerWallet, balance, balanceAsset);
+
+      res.status(eligibility.isEligible ? 200 : 403).json({
+        isEligible: eligibility.isEligible,
+        errors: eligibility.errors,
+        warnings: eligibility.warnings,
+        metadata: eligibility.metadata,
+        requestId: randomUUID(),
+      });
+    }),
+  );
+
+  /**
    * GET /api/arenas/:id/stream
    * Streams arena lifecycle events using Server-Sent Events.
    *
@@ -295,6 +343,8 @@ export function createArenasRouter(authMiddleware: RequestHandler): Router {
    */
   router.get(
     "/:id/stream",
+    authMiddleware,
+    sseConnectionLimiter,
     asyncHandler(async (req, res) => {
       const id = req.params.id!;
 
@@ -315,6 +365,7 @@ export function createArenasRouter(authMiddleware: RequestHandler): Router {
       const sendSnapshot = (data: unknown, sequence?: number): void => {
         if (res.writableEnded) return;
         if (sequence !== undefined) res.write(`id: ${sequence}\n`);
+        res.write(`event: snapshot\n`);
         res.write(`data: ${JSON.stringify(data)}\n\n`);
       };
 
@@ -331,6 +382,85 @@ export function createArenasRouter(authMiddleware: RequestHandler): Router {
       );
 
       req.on("close", unsubscribe);
+    }),
+  );
+
+  /**
+   * POST /api/arenas/:id/sync-players
+   * Syncs on-chain player list to the database.
+   * Reads the contract's get_players() paginated response and upserts player records.
+   */
+  // Same protection as pools/wallet-role: this route reaches Soroban RPC on
+  // every call, so it needs a budget rather than none at all (#1351).
+  const syncPlayersRateLimiter = createRateLimitMiddleware(getSyncPlayersRateLimitConfig());
+
+  router.post(
+    "/:id/sync-players",
+    authMiddleware,
+    syncPlayersRateLimiter,
+    asyncHandler(async (req, res) => {
+      const id = req.params.id;
+      if (!id) {
+        throw apiError(400, "INVALID_ARENA_ID", "Arena id is required");
+      }
+
+      const arena = await prisma.arena.findUnique({ where: { id } });
+      if (!arena) {
+        throw apiError(404, "ARENA_NOT_FOUND", `Arena with ID ${id} not found`);
+      }
+
+      const metadata = (arena.metadata as Record<string, unknown>) ?? {};
+
+      // Authorisation (#1351): a valid JWT alone used to be enough, so any
+      // logged-in wallet could drive a live simulateTransaction plus DB writes
+      // for every arena id in the system — an authenticated amplification
+      // vector against the Soroban RPC with no relationship to the arena.
+      // Syncing is now limited to the arena's creator and admin wallets.
+      const caller = req.user?.walletAddress;
+      if (!caller) {
+        throw apiError(401, "UNAUTHORIZED", "Unauthorized");
+      }
+
+      const createdBy = metadata.createdBy as string | undefined;
+      const isOwner = createdBy !== undefined && createdBy === caller;
+
+      if (!isOwner && !isAuthorizedAdminWallet(caller)) {
+        throw apiError(
+          403,
+          "FORBIDDEN",
+          "Only the arena creator or an admin may sync players for this arena",
+        );
+      }
+
+      const contractAddress = metadata.contractAddress as string | undefined;
+
+      if (!contractAddress) {
+        throw apiError(400, "NO_CONTRACT_ADDRESS", "Arena has no contract address");
+      }
+
+      // Fetch on-chain player list
+      const onChainPlayers = await getOnChainPlayers(contractAddress);
+
+      // Batch-create User records for any wallet addresses that don't exist
+      // yet. `skipDuplicates` makes this a single round trip instead of one
+      // upsert per player (existing users are left untouched, matching the
+      // no-op `update: {}` the previous per-player upsert used).
+      await prisma.user.createMany({
+        data: onChainPlayers.map((walletAddress) => ({ walletAddress })),
+        skipDuplicates: true,
+      });
+
+      // `syncedPlayers` mirrors `totalPlayers`, matching the previous
+      // per-player upsert loop, which always processed every on-chain
+      // player regardless of whether the User record was newly created.
+      const syncedCount = onChainPlayers.length;
+
+      res.json({
+        arenaId: id,
+        totalPlayers: onChainPlayers.length,
+        syncedPlayers: syncedCount,
+        message: `Synced ${syncedCount} players from on-chain`,
+      });
     }),
   );
 

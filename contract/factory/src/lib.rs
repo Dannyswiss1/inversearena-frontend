@@ -2,7 +2,7 @@
 
 mod snapshot_tests;
 mod storage;
-mod types;
+pub mod types;
 
 #[cfg(test)]
 mod integration_tests;
@@ -10,10 +10,50 @@ mod integration_tests;
 use storage::{CreatorStakeRecord, FactoryStorage};
 use types::{ArenaMetadata, ArenaStatus, FactoryError, PoolConfig};
 
-use arena::ArenaContractClient;
-use soroban_sdk::{Address, BytesN, Env, Vec, contract, contractimpl, symbol_short, token};
+use soroban_sdk::{
+    Address, BytesN, Env, Vec, contract, contractclient, contractimpl, symbol_short, token,
+};
+
+/// Must match `arena::MAX_PLAYERS_ALLOWED` (contract/arena/src/lib.rs) exactly
+/// — kept as a duplicated local constant, not `use arena::MAX_PLAYERS_ALLOWED`,
+/// because depending on the `arena` crate as a real (non-dev) dependency here
+/// statically links its `#[contractimpl]` block into factory's own wasm
+/// binary, and both contracts export an `unpause` symbol, which collides at
+/// link time (see the "Optimize contract WASM" Contract CI step). `arena`
+/// stays a dev-dependency for integration tests, which need the real
+/// contract. If this drifts from arena's constant, `create_pool` will accept
+/// configs arena's own `initialize` then rejects, reverting the transaction.
+const MAX_PLAYERS_ALLOWED: u32 = 100;
+
+/// Local stub for the one arena entry point factory calls in production
+/// (`initialize`, right after deploying a new arena instance). Deliberately
+/// not `use arena::ArenaContractClient` — depending on the full `arena`
+/// crate here would statically link its `#[contractimpl]` block into
+/// factory's own wasm binary, and both contracts export an `unpause`
+/// symbol, which collides at link time. `arena` stays a dev-dependency for
+/// integration tests, which need the real contract.
+#[contractclient(name = "ArenaClient")]
+pub trait ArenaInterface {
+    #[allow(clippy::too_many_arguments)]
+    fn initialize(
+        env: Env,
+        admin: Address,
+        stake_token: Address,
+        yield_vault: Address,
+        entry_fee: i128,
+        oracle_contract: Address,
+        factory: Address,
+        pool_id: u32,
+        min_players: u32,
+        max_players: u32,
+        round_duration: u64,
+    );
+}
 
 const MAX_PAGE_SIZE: u32 = 50;
+const MIN_ROUND_DURATION: u64 = 60;
+const MAX_ROUND_DURATION: u64 = 604_800;
+const MIN_PLAYERS: u32 = 2;
 
 /// Factory contract — deploys arena instances and enforces protocol-level rules.
 ///
@@ -104,6 +144,14 @@ impl FactoryContract {
         Ok(())
     }
 
+    pub fn is_approved_vault(env: Env, vault: Address) -> bool {
+        FactoryStorage::is_approved_vault(&env, &vault)
+    }
+
+    pub fn is_approved_oracle(env: Env, oracle: Address) -> bool {
+        FactoryStorage::is_approved_oracle(&env, &oracle)
+    }
+
     pub fn add_supported_token(env: Env, token: Address) -> Result<(), FactoryError> {
         Self::require_admin(&env)?;
         FactoryStorage::set_supported_token(&env, &token, true);
@@ -158,10 +206,21 @@ impl FactoryContract {
     /// Called by the arena contract itself (verified via creator stake record)
     /// when the arena finishes or is cancelled. Decrements the creator's active
     /// pool count, allowing the creator to deploy new arenas.
+    /// Deliberately **not** gated on `is_paused` (#1360).
+    ///
+    /// Pause exists to stop new activity — chiefly `create_pool`. This is the
+    /// opposite: a bookkeeping decrement for an arena that has already finished
+    /// or cancelled, triggered by that arena's own lifecycle, not by a user
+    /// starting something new.
+    ///
+    /// Gating it caused permanent damage. The arena calls this exactly once, via
+    /// `try_release_arena`, with no retry path. If the factory happened to be
+    /// paused at that moment the call failed silently, while the neighbouring
+    /// `try_reclaim_creator_stake` — which has no pause check — still succeeded
+    /// and removed the stake record. Any later retry then fails with
+    /// `ArenaNotFound`, so the creator loses one `max_active_pools` slot forever,
+    /// for an arena that has already fully completed.
     pub fn release_arena(env: Env, arena: Address) -> Result<(), FactoryError> {
-        if FactoryStorage::is_paused(&env) {
-            return Err(FactoryError::ContractPaused);
-        }
         arena.require_auth();
 
         // Verify this arena was deployed by the factory
@@ -186,6 +245,14 @@ impl FactoryContract {
         host.require_auth();
         FactoryStorage::load_admin(&env)?;
 
+        if config.round_duration < MIN_ROUND_DURATION
+            || config.round_duration > MAX_ROUND_DURATION
+            || config.min_players < MIN_PLAYERS
+            || config.min_players > config.max_players
+            || config.max_players > MAX_PLAYERS_ALLOWED
+        {
+            return Err(FactoryError::InvalidConfig);
+        }
         if !FactoryStorage::is_whitelisted(&env, &host) {
             return Err(FactoryError::HostNotWhitelisted);
         }
@@ -198,6 +265,12 @@ impl FactoryContract {
         }
         if !FactoryStorage::is_supported_token(&env, &config.stake_token) {
             return Err(FactoryError::UnsupportedToken);
+        }
+        if !FactoryStorage::is_approved_vault(&env, &config.yield_vault) {
+            return Err(FactoryError::InvalidVault);
+        }
+        if !FactoryStorage::is_approved_oracle(&env, &config.oracle_contract) {
+            return Err(FactoryError::InvalidOracle);
         }
 
         // Check active pool limit for this host
@@ -220,7 +293,7 @@ impl FactoryContract {
             .with_current_contract(Self::salt_for_pool(&env, pool_id))
             .deploy_v2(wasm_hash, ());
 
-        ArenaContractClient::new(&env, &arena).initialize(
+        ArenaClient::new(&env, &arena).initialize(
             &host,
             &config.stake_token,
             &config.yield_vault,
@@ -342,8 +415,8 @@ impl FactoryContract {
         let total = FactoryStorage::pool_count(&env);
         let limit = core::cmp::min(limit, MAX_PAGE_SIZE);
         let mut result: Vec<ArenaMetadata> = Vec::new(&env);
-        let start = offset + 1;
-        let end = core::cmp::min(total, offset + limit);
+        let start = offset.saturating_add(1);
+        let end = core::cmp::min(total, offset.saturating_add(limit));
         if start <= end {
             for pool_id in start..=end {
                 if let Some(meta) = FactoryStorage::load_pool(&env, pool_id) {
@@ -358,6 +431,27 @@ impl FactoryContract {
         let admin = FactoryStorage::load_admin(env)?;
         admin.require_auth();
         Ok(admin)
+    }
+
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
+        let admin = FactoryStorage::load_admin(&env)?;
+        admin.require_auth();
+        FactoryStorage::save_pending_admin(&env, &new_admin);
+        env.events()
+            .publish((symbol_short!("ADM_PROP"),), (new_admin,));
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env) -> Result<(), FactoryError> {
+        let pending_admin =
+            FactoryStorage::load_pending_admin(&env).ok_or(FactoryError::NoPendingAdmin)?;
+        pending_admin.require_auth();
+        let old_admin = FactoryStorage::load_admin(&env)?;
+        FactoryStorage::save_admin(&env, &pending_admin);
+        FactoryStorage::delete_pending_admin(&env);
+        env.events()
+            .publish((symbol_short!("ADM_CHG"),), (old_admin, pending_admin));
+        Ok(())
     }
 
     fn salt_for_pool(env: &Env, pool_id: u32) -> BytesN<32> {
@@ -420,6 +514,74 @@ mod test {
             .expect("error must be a contract error");
 
         assert_eq!(err, FactoryError::HostNotWhitelisted);
+    }
+
+    fn assert_invalid_config(update: impl FnOnce(&mut PoolConfig)) {
+        let (env, client, _admin, host) = setup();
+        let mut config = pool_config(&env, 100);
+        update(&mut config);
+        let error = client
+            .try_create_pool(&host, &config)
+            .err()
+            .expect("invalid config must be rejected")
+            .expect("error must be a contract error");
+        assert_eq!(error, FactoryError::InvalidConfig);
+    }
+
+    #[test]
+    fn create_pool_rejects_round_duration_below_minimum() {
+        assert_invalid_config(|config| config.round_duration = 59);
+    }
+
+    #[test]
+    fn create_pool_rejects_round_duration_above_maximum() {
+        assert_invalid_config(|config| {
+            config.round_duration = 604_801
+        });
+    }
+
+    #[test]
+    fn create_pool_rejects_fewer_than_two_players() {
+        assert_invalid_config(|config| config.min_players = 1);
+    }
+
+    #[test]
+    fn create_pool_rejects_min_players_above_max_players() {
+        assert_invalid_config(|config| {
+            config.min_players = 11
+        });
+    }
+
+    #[test]
+    fn create_pool_rejects_more_than_one_hundred_players() {
+        assert_invalid_config(|config| {
+            config.max_players = MAX_PLAYERS_ALLOWED + 1
+        });
+    }
+
+    #[test]
+    fn create_pool_rejects_max_players_in_101_to_1000_range() {
+        // Regression test: factory once accepted values 101..=1000 which arena
+        // would reject, causing transaction reversion. Now both use the same
+        // constant, and factory validates early before any deployment attempt.
+        let (env, client, _admin, host) = setup();
+        client.add_to_whitelist(&host);
+
+        let test_values = [101u32, 200, 500, 999, 1000];
+        for max_players in test_values.iter() {
+            let mut config = pool_config(&env, 100);
+            config.max_players = *max_players;
+            let err = client
+                .try_create_pool(&host, &config)
+                .err()
+                .expect("max_players > 100 must be rejected")
+                .expect("error must be a contract error");
+            assert_eq!(
+                err,
+                FactoryError::InvalidConfig,
+                "max_players > 100 must return InvalidConfig, not trap with uninitialized contract"
+            );
+        }
     }
 
     #[test]
@@ -618,5 +780,166 @@ mod test {
         assert!(client.is_token_supported(&token));
         client.remove_supported_token(&token);
         assert!(!client.is_token_supported(&token));
+    }
+
+    #[test]
+    fn approved_vault_and_oracle_add_and_remove_controls_status() {
+        let (env, client, _admin, _host) = setup();
+        let vault = Address::generate(&env);
+        let oracle = Address::generate(&env);
+
+        assert!(!client.is_approved_vault(&vault));
+        client.add_approved_vault(&vault);
+        assert!(client.is_approved_vault(&vault));
+        client.remove_approved_vault(&vault);
+        assert!(!client.is_approved_vault(&vault));
+
+        assert!(!client.is_approved_oracle(&oracle));
+        client.add_approved_oracle(&oracle);
+        assert!(client.is_approved_oracle(&oracle));
+        client.remove_approved_oracle(&oracle);
+        assert!(!client.is_approved_oracle(&oracle));
+    }
+
+    #[test]
+    fn create_pool_rejects_unapproved_vault() {
+        let (env, client, _admin, host) = setup();
+        client.add_to_whitelist(&host);
+        
+        let cfg = pool_config(&env, 100);
+        client.add_supported_token(&cfg.stake_token);
+        client.add_approved_oracle(&cfg.oracle_contract);
+
+        let err = client
+            .try_create_pool(&host, &cfg)
+            .err()
+            .expect("unapproved vault must error")
+            .expect("error must be a contract error");
+        assert_eq!(err, FactoryError::InvalidVault);
+    }
+
+    #[test]
+    fn create_pool_rejects_unapproved_oracle() {
+        let (env, client, _admin, host) = setup();
+        client.add_to_whitelist(&host);
+        
+        let cfg = pool_config(&env, 100);
+        client.add_supported_token(&cfg.stake_token);
+        client.add_approved_vault(&cfg.yield_vault);
+
+        let err = client
+            .try_create_pool(&host, &cfg)
+            .err()
+            .expect("unapproved oracle must error")
+            .expect("error must be a contract error");
+        assert_eq!(err, FactoryError::InvalidOracle);
+    }
+    // ── Regression: pause must not strand a pool slot (#1360) ────────────────
+    //
+    // release_arena and reclaim_creator_stake are both called exactly once per
+    // arena, from the same lifecycle transition, via try_* with no retry. When
+    // release_arena was pause-gated, a factory paused at that moment lost the
+    // decrement while the stake was still refunded and its record deleted —
+    // costing the creator a max_active_pools slot permanently, for an arena that
+    // had already completed.
+
+    /// Register an arena against `creator` as though the factory had deployed it,
+    /// and count it towards their active pools.
+    fn register_arena_for(env: &Env, factory: &Address, creator: &Address) -> Address {
+        let arena = Address::generate(env);
+
+        // A real asset contract, funded so reclaim_creator_stake's transfer can
+        // actually settle — otherwise the test would fail on the token, not on
+        // the behaviour under test.
+        let token_admin = Address::generate(env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        soroban_sdk::token::StellarAssetClient::new(env, &token).mint(factory, &100);
+
+        env.as_contract(factory, || {
+            FactoryStorage::save_creator_stake(
+                env,
+                &arena,
+                &CreatorStakeRecord {
+                    creator: creator.clone(),
+                    amount: 100,
+                    stake_token: token,
+                },
+            );
+            FactoryStorage::increment_active_pool_count(env, creator);
+        });
+        arena
+    }
+
+    fn active_pool_count(env: &Env, factory: &Address, creator: &Address) -> u32 {
+        env.as_contract(factory, || FactoryStorage::load_active_pool_count(env, creator))
+    }
+
+    #[test]
+    fn release_arena_succeeds_while_the_factory_is_paused() {
+        let (env, client, _admin, creator) = setup();
+        let arena = register_arena_for(&env, &client.address, &creator);
+        assert_eq!(active_pool_count(&env, &client.address, &creator), 1);
+
+        client.pause();
+
+        assert!(
+            client.try_release_arena(&arena).is_ok(),
+            "releasing a completed arena is bookkeeping, not new activity — pause must not block it",
+        );
+        assert_eq!(
+            active_pool_count(&env, &client.address, &creator),
+            0,
+            "the creator's slot must be freed even though the factory was paused",
+        );
+    }
+
+    #[test]
+    fn a_paused_completion_window_does_not_cost_the_creator_a_slot() {
+        let (env, client, _admin, creator) = setup();
+        let arena = register_arena_for(&env, &client.address, &creator);
+
+        // The arena finishes while the factory happens to be paused: both calls
+        // fire together, exactly as resolve_round and expire_arena issue them.
+        client.pause();
+        let released = client.try_release_arena(&arena);
+        let reclaimed = client.try_reclaim_creator_stake(&arena);
+
+        assert!(released.is_ok(), "release must not be refused during pause");
+        assert!(reclaimed.is_ok(), "reclaim was never pause-gated");
+        assert_eq!(
+            active_pool_count(&env, &client.address, &creator),
+            0,
+            "slot must be released; previously it leaked and could never be recovered",
+        );
+    }
+
+    #[test]
+    fn pause_still_blocks_new_pool_creation() {
+        let (env, client, _admin, host) = setup();
+        client.add_to_whitelist(&host);
+        client.pause();
+
+        // Removing the gate from release_arena must not weaken the pause switch
+        // where it actually matters.
+        let err = client
+            .try_create_pool(&host, &pool_config(&env, 100))
+            .err()
+            .expect("paused factory must still refuse new pools")
+            .expect("error must be a contract error");
+
+        assert_eq!(err, FactoryError::ContractPaused);
+    }
+
+    #[test]
+    fn release_arena_still_rejects_an_unknown_arena() {
+        let (env, client, _admin, _creator) = setup();
+
+        let err = client
+            .try_release_arena(&Address::generate(&env))
+            .err()
+            .expect("an arena the factory never deployed must error")
+            .expect("error must be a contract error");
+
+        assert_eq!(err, FactoryError::ArenaNotFound);
     }
 }

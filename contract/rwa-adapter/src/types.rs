@@ -12,6 +12,7 @@ pub struct PendingAdmin {
 pub struct RwaConfig {
     pub admin: Address,
     pub stake_token: Address,
+    pub oracle: Address,
     pub total_deposited: i128,
 }
 
@@ -20,6 +21,7 @@ pub struct RwaConfig {
 pub struct YieldAccrual {
     pub principal: i128,
     pub withdrawn: bool,
+    pub deposited_at: u64,
 }
 
 #[contracterror]

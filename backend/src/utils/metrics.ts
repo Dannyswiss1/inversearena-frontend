@@ -76,6 +76,13 @@ export const payoutsSuccessTotal = new Counter({
   registers: [register],
 });
 
+export const payoutsDeadLetterTotal = new Counter({
+  name: 'inversearena_payouts_dead_letter_total',
+  help: 'Total payouts moved to dead status after exhausting failed retries',
+  labelNames: ['reason'],
+  registers: [register],
+});
+
 // 0 = closed (healthy), 1 = half-open (probing), 2 = open (failing)
 export const sorobanCircuitBreakerState = new Gauge({
   name: 'inversearena_soroban_circuit_breaker_state',
@@ -87,6 +94,20 @@ export const sorobanCircuitTransitionsTotal = new Counter({
   name: 'inversearena_soroban_circuit_transitions_total',
   help: 'Total Soroban RPC circuit breaker state transitions',
   labelNames: ['to_state'],
+  registers: [register],
+});
+
+export const maintenanceMutationsBlockedTotal = new Counter({
+  name: 'inversearena_maintenance_mutations_blocked_total',
+  help: 'Total mutating requests rejected because a maintenance window was active',
+  labelNames: ['method'],
+  registers: [register],
+});
+
+export const maintenanceWindowsScheduledTotal = new Counter({
+  name: 'inversearena_maintenance_windows_scheduled_total',
+  help: 'Total maintenance windows scheduled, by outcome',
+  labelNames: ['status'],
   registers: [register],
 });
 

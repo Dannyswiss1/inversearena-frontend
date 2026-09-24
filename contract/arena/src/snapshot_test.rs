@@ -77,13 +77,14 @@ mod snapshot_tests {
             state: GameState::Open,
             paused: false,
             player_count: 42,
+            active_player_count: 42,
             cumulative_yield: 0,
             commit_deadline: 1_730_000_000,
             round_count: 0,
             oracle_contract: Address::generate(&env),
             factory: Address::generate(&env),
             pool_id: 0,
-            round_duration: 0,
+            platform_fee_bps: 1000,
         };
         let config_b = ArenaConfig {
             admin: Address::generate(&env),
@@ -93,13 +94,14 @@ mod snapshot_tests {
             state: GameState::Open,
             paused: false,
             player_count: 42,
+            active_player_count: 42,
             cumulative_yield: 0,
             commit_deadline: 1_730_000_000,
             round_count: 0,
             oracle_contract: Address::generate(&env),
             factory: Address::generate(&env),
             pool_id: 0,
-            round_duration: 0,
+            platform_fee_bps: 1000,
         };
 
         let xdr_a = to_xdr(&env, config_a);

@@ -8,6 +8,7 @@
  */
 
 import type { ArenaService } from "../services/arenaService";
+import { getSorobanBreaker } from "../utils/circuitBreaker";
 
 interface Subscriber {
   /** Send an SSE event to this client. */
@@ -30,12 +31,22 @@ interface ArenaPollerState {
   sequence: number;
   history: Array<{ event: string; payload: unknown; sequence: number }>;
   lastSnapshot: { payload: unknown; sequence: number } | null;
+  consecutiveFailures: number;
 }
 
 const pollers = new Map<string, ArenaPollerState>();
 
 const POLL_INTERVAL_MS = 2_500;
+const POLL_RETRY_MAX_MS = 60_000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+
+export function computePollDelay(consecutiveFailures: number): number {
+  if (consecutiveFailures <= 0) return POLL_INTERVAL_MS;
+  return Math.min(
+    POLL_INTERVAL_MS * 2 ** (consecutiveFailures - 1),
+    POLL_RETRY_MAX_MS,
+  );
+}
 
 function writeSseEvent(
   res: { write: (chunk: string) => void },
@@ -70,6 +81,7 @@ export function subscribeArena(
       sequence: 0,
       history: [],
       lastSnapshot: null,
+      consecutiveFailures: 0,
     };
     pollers.set(arenaId, state);
   }
@@ -125,7 +137,10 @@ function startPollLoop(
     if (state.subscribers.size === 0) return;
 
     try {
-      const snapshot = await arenaService.getSnapshot(arenaId);
+      const snapshot = await getSorobanBreaker().fire(() =>
+        arenaService.getSnapshot(arenaId),
+      );
+      state.consecutiveFailures = 0;
       const isFirstPoll = state.lastRoundState === null && state.lastStatus === null;
 
       if (isFirstPoll) {
@@ -185,6 +200,7 @@ function startPollLoop(
         state.lastSurvivorCount = snapshot.survivorCount;
       }
     } catch (error) {
+      state.consecutiveFailures += 1;
       // Broadcast error to all subscribers
       for (const sub of state.subscribers) {
         try {
@@ -208,7 +224,7 @@ function startPollLoop(
       if (state.subscribers.size > 0) {
         state.pollTimer = setTimeout(() => {
           void poll();
-        }, POLL_INTERVAL_MS);
+        }, computePollDelay(state.consecutiveFailures));
       }
     }
   };

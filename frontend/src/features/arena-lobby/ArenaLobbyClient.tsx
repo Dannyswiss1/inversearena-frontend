@@ -1,45 +1,62 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { z } from "zod";
 import { useRouter } from "next/navigation";
 import { ArenaStatsSkeleton } from "@/components/arena/ArenaStatsSkeleton";
 import { ChoiceSubmission } from "@/components/arena/ChoiceSubmission";
-import { useStellarWallet } from "@/features/wallet/useStellarWallet";
-import { stellarConfig } from "@/lib/stellarConfig";
+import { TransactionModal, type TransactionProgress } from "@/components/modals/TransactionModal";
+import { useWallet } from "@/features/wallet/useWallet";
+import {
+  buildJoinArenaTransaction,
+  submitSignedTransaction,
+} from "@/shared-d/utils/stellar-transactions";
 
-interface ArenaStats {
-  arenaId: string;
-  arenaName: string;
-  currentPot: number;
-  playerCount: number;
-  maxPlayers: number;
-  survivorCount: number;
-  currentRound: number;
-  entryFee: number;
-  stakeToken: string;
-  joinDeadline: string | null;
-  yieldAccrued: number;
-  status: string;
-  lastUpdated: string;
-}
+const arenaParticipantSchema = z.object({
+  id: z.string(),
+  walletAddress: z.string(),
+  // null while the round is still OPEN — the backend hides other players'
+  // choices until the round closes so callers can't vote accordingly (#1212).
+  choice: z.enum(["heads", "tails"]).nullable(),
+  stake: z.number(),
+  status: z.enum(["READY", "ACTIVE", "ELIMINATED"]),
+  roundNumber: z.number(),
+  joinedAt: z.string(),
+});
 
-interface ArenaParticipant {
-  id: string;
-  walletAddress: string;
-  choice: "heads" | "tails";
-  stake: number;
-  status: "READY" | "ACTIVE" | "ELIMINATED";
-  roundNumber: number;
-  joinedAt: string;
-}
+const arenaStatsSchema = z.object({
+  arenaId: z.string(),
+  arenaName: z.string(),
+  currentPot: z.number(),
+  playerCount: z.number(),
+  maxPlayers: z.number(),
+  survivorCount: z.number(),
+  currentRound: z.number(),
+  entryFee: z.number(),
+  stakeToken: z.string(),
+  joinDeadline: z.string().nullable(),
+  yieldAccrued: z.number(),
+  status: z.string(),
+  lastUpdated: z.string(),
+  // #1408: present once the backend has ever completed a live on-chain read
+  // for this arena; optional so a response from before this field existed
+  // (or an intermediate cache entry) still validates.
+  degraded: z.boolean().optional(),
+  ledgerSequence: z.number().nullable().optional(),
+  snapshotVerifiedAt: z.string().nullable().optional(),
+});
 
-interface ArenaParticipantsResponse {
-  arenaId: string;
-  total: number;
-  nextCursor: number | null;
-  hasMore: boolean;
-  items: ArenaParticipant[];
-}
+const arenaParticipantsResponseSchema = z.object({
+  arenaId: z.string(),
+  total: z.number(),
+  nextCursor: z.number().nullable(),
+  hasMore: z.boolean(),
+  items: z.array(arenaParticipantSchema),
+});
+
+type ArenaStats = z.infer<typeof arenaStatsSchema>;
+type ArenaParticipant = z.infer<typeof arenaParticipantSchema>;
+type ArenaParticipantsResponse = z.infer<typeof arenaParticipantsResponseSchema>;
 
 interface ArenaLobbyClientProps {
   arenaId: string;
@@ -61,7 +78,8 @@ function formatCurrency(value: number, token: string): string {
 }
 
 function formatCountdown(joinDeadline: string | null): string {
-  if (!joinDeadline) return "Unknown";
+  // null deadline means no deadline (open-ended arena)
+  if (!joinDeadline) return "No deadline";
   const remaining = Math.max(0, Date.parse(joinDeadline) - Date.now());
   const totalSeconds = Math.floor(remaining / 1000);
   const hours = Math.floor(totalSeconds / 3600);
@@ -88,7 +106,7 @@ export function ArenaLobbyClient({
   notFound = false,
 }: ArenaLobbyClientProps) {
   const router = useRouter();
-  const wallet = useStellarWallet(stellarConfig.network);
+  const wallet = useWallet();
   const [stats, setStats] = useState<ArenaStats | null>(initialStats);
   const [participants, setParticipants] = useState<ArenaParticipant[]>(
     initialParticipants,
@@ -98,6 +116,7 @@ export function ArenaLobbyClient({
   const [loadingStats, setLoadingStats] = useState(false);
   const [loadingParticipants, setLoadingParticipants] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showJoinModal, setShowJoinModal] = useState(false);
 
   const isOpen = stats?.status === "open";
   const walletConnected = wallet.isConnected && !!wallet.publicKey;
@@ -136,8 +155,12 @@ export function ArenaLobbyClient({
         throw new Error(`Stats request failed (${response.status})`);
       }
 
-      const data = (await response.json()) as ArenaStats;
-      setStats(data);
+      const json = await response.json();
+      const parsed = arenaStatsSchema.safeParse(json);
+      if (!parsed.success) {
+        throw new Error(`Invalid stats response: ${parsed.error.message}`);
+      }
+      setStats(parsed.data);
       setError(null);
     } catch (fetchError) {
       setError(
@@ -164,7 +187,12 @@ export function ArenaLobbyClient({
         throw new Error(`Participants request failed (${response.status})`);
       }
 
-      const data = (await response.json()) as ArenaParticipantsResponse;
+      const json = await response.json();
+      const parsed = arenaParticipantsResponseSchema.safeParse(json);
+      if (!parsed.success) {
+        throw new Error(`Invalid participants response: ${parsed.error.message}`);
+      }
+      const data = parsed.data;
       if (replace || cursor === 0) {
         mergeParticipants(data.items);
       } else {
@@ -254,12 +282,36 @@ export function ArenaLobbyClient({
 
   const playerCapacity =
     stats.maxPlayers > 0 ? `${stats.playerCount}/${stats.maxPlayers}` : `${stats.playerCount}`;
-  const joinDisabled = !isOpen || !stats.joinDeadline || loadingStats || !walletConnected;
+  // joinDeadline === null means "no deadline" (always open), not "already passed"
+  const hasPassedDeadline = stats.joinDeadline && Date.parse(stats.joinDeadline) <= Date.now();
+  const joinDisabled = !isOpen || hasPassedDeadline || loadingStats || !walletConnected;
   const joinLabel = !walletConnected
     ? "Wallet Required"
     : joinDisabled
       ? "Join Unavailable"
       : "Join Arena";
+
+  const handleConfirmJoin = async ({ onSigned }: TransactionProgress) => {
+    if (!wallet.publicKey) {
+      throw new Error("Connect a wallet before joining this arena.");
+    }
+
+    const unsignedTx = await buildJoinArenaTransaction(
+      wallet.publicKey,
+      arenaId,
+    );
+    const signedXdr = await wallet.signTransaction(unsignedTx.toXDR());
+    onSigned();
+    await submitSignedTransaction(signedXdr);
+
+    await Promise.all([fetchStats(), fetchParticipants(0, true)]);
+
+    setShowJoinModal(false);
+    document.getElementById("choice-submission")?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  };
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(60,255,26,0.14),_transparent_36%),linear-gradient(180deg,_#050816_0%,_#07111d_42%,_#050816_100%)] px-4 py-6 text-white sm:px-6 lg:px-8">
@@ -273,6 +325,17 @@ export function ArenaLobbyClient({
                   {stats.status.toUpperCase()} / Round {stats.currentRound}
                 </span>
               </div>
+              {stats.degraded && (
+                <div
+                  role="status"
+                  className="inline-flex items-center gap-2 rounded-full border border-amber-400/40 bg-amber-950/60 px-3 py-1"
+                >
+                  <span className="h-2 w-2 rounded-full bg-amber-400" />
+                  <span className="text-[10px] font-semibold uppercase tracking-[0.22em] text-amber-200">
+                    Delayed data{stats.ledgerSequence != null ? ` — as of ledger ${stats.ledgerSequence}` : ""}
+                  </span>
+                </div>
+              )}
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.3em] text-white/45">
                   Arena Lobby
@@ -337,12 +400,7 @@ export function ArenaLobbyClient({
             <button
               type="button"
               disabled={joinDisabled}
-              onClick={() => {
-                document.getElementById("choice-submission")?.scrollIntoView({
-                  behavior: "smooth",
-                  block: "start",
-                });
-              }}
+              onClick={() => setShowJoinModal(true)}
               className="rounded-full border border-[#3CFF1A]/40 bg-[#3CFF1A] px-6 py-3 text-sm font-black uppercase tracking-[0.2em] text-black transition hover:brightness-95 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/10 disabled:text-white/40"
             >
               {joinLabel}
@@ -395,12 +453,14 @@ export function ArenaLobbyClient({
                       </span>
                       <span
                         className={
-                          participant.choice === "heads"
-                            ? "font-semibold text-[#3CFF1A]"
-                            : "font-semibold text-[#FF0A54]"
+                          participant.choice === null
+                            ? "font-semibold text-white/40"
+                            : participant.choice === "heads"
+                              ? "font-semibold text-[#3CFF1A]"
+                              : "font-semibold text-[#FF0A54]"
                         }
                       >
-                        {participant.choice.toUpperCase()}
+                        {participant.choice === null ? "HIDDEN" : participant.choice.toUpperCase()}
                       </span>
                       <span className="font-mono text-white/80">
                         {participant.stake.toLocaleString()}
@@ -445,7 +505,23 @@ export function ArenaLobbyClient({
                 roundNumber={stats.currentRound}
                 deadline={stats.joinDeadline ?? ""}
                 arenaStatus={stats.status}
-                wallet={wallet}
+                wallet={{
+                  publicKey: wallet.publicKey,
+                  isConnected: wallet.isConnected,
+                  status: wallet.status,
+                  signTransaction: wallet.signTransaction,
+                  // ChoiceSubmission expects connectWallet() to resolve with
+                  // the connected address (it falls back to the return value
+                  // when publicKey isn't set yet). The shared wallet
+                  // context's connect() resolves with that same address.
+                  connectWallet: async () => {
+                    const address = await wallet.connect();
+                    if (!address) {
+                      throw new Error("Wallet connection did not return an address.");
+                    }
+                    return address;
+                  },
+                }}
               />
             </div>
 
@@ -480,6 +556,19 @@ export function ArenaLobbyClient({
           </div>
         </section>
       </main>
+
+      <TransactionModal
+        isOpen={showJoinModal}
+        onClose={() => setShowJoinModal(false)}
+        title="Join Arena"
+        description="Confirm your entry to this arena"
+        details={[
+          { label: "Arena", value: stats.arenaName },
+          { label: "Entry Fee", value: formatCurrency(stats.entryFee, stats.stakeToken) },
+        ]}
+        confirmLabel="Sign & Join"
+        onConfirm={handleConfirmJoin}
+      />
     </div>
   );
 }

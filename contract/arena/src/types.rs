@@ -50,6 +50,9 @@ pub struct ArenaConfig {
     /// Total number of players that have ever joined this arena. Kept in sync
     /// by `ArenaStorage::add_player` so it can be read without scanning storage.
     pub player_count: u32,
+    /// Number of active players remaining in the game (not eliminated). Kept in sync
+    /// by `ArenaStorage::add_player` and `resolve_round` so it can be read without scanning storage.
+    pub active_player_count: u32,
     /// Cumulative yield accrued across all resolved rounds.
     pub cumulative_yield: i128,
     /// Ledger timestamp (seconds) after which commitments are no longer
@@ -63,7 +66,12 @@ pub struct ArenaConfig {
     pub oracle_contract: Address,
     pub factory: Address,
     pub pool_id: u32,
-    pub round_duration: u64,
+    /// Platform fee in basis points, snapshotted from the global admin-configured
+    /// value at `initialize` time (see `ArenaContract::update_platform_fee`).
+    /// Max 1000 bps (10%). Not currently deducted anywhere in the payout path —
+    /// `claim` pays out principal + yield in full; wiring an actual fee cut into
+    /// that flow is a deliberate follow-up, not implied by this field's presence.
+    pub platform_fee_bps: u32,
 }
 
 /// Wrapper for a pending admin transfer proposal.
@@ -255,6 +263,17 @@ pub enum ArenaError {
     /// The entry fee token transfer succeeded but the vault deposit did not. The contract
     /// rolls back the token transfer so no funds are left permanently locked.
     VaultDepositFailed = 35,
+
+    /// Returned when `update_platform_fee` is called with a value above `MAX_PLATFORM_FEE_BPS`.
+    InvalidPlatformFee = 36,
+
+    /// Returned by `join_arena` once at least one round has been played.
+    ///
+    /// The arena returns to `Open` between rounds so `start_round` can run
+    /// again, so `state == Open` alone does not mean the lobby is still
+    /// recruiting. Joining after eliminations would let a latecomer buy in at
+    /// the original entry fee against a thinned field.
+    ArenaAlreadyStarted = 37,
 }
 
 #[contracttype]

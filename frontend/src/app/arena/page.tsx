@@ -11,7 +11,7 @@ import {
   ChooseYourFate,
   TotalYieldPot,
 } from "@/components/arena/core";
-import { useWallet } from "@/shared-d/hooks/useWallet";
+import { useWallet } from "@/features/wallet/useWallet";
 import { TransactionModal } from "@/components/modals/TransactionModal";
 import { ArenaStatsSkeleton } from "@/components/arena/ArenaStatsSkeleton";
 import {
@@ -23,8 +23,14 @@ import {
   fetchArenaState,
   clearCommitmentForRound,
   hasStoredCommitmentForRound,
+  captureTransactionOutcome,
+  reconcileTransaction,
+  type TransactionOutcome,
 } from "@/shared-d/utils/stellar-transactions";
 import { useArenaStream } from "@/features/arena/useArenaStream";
+
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
 
 // Commit-reveal phase windows (#1137). These are local, client-side timers —
 // the contract's real commit_deadline isn't yet exposed to the frontend via
@@ -105,7 +111,7 @@ function ArenaGameView() {
   useEffect(() => {
     async function fetchYield() {
       try {
-        const response = await fetch("/api/oracle/yield");
+        const response = await fetch(`${API_BASE}/api/oracle/yield`);
         const data = await response.json();
         setOracleYield(data.currentAPY);
       } catch (err) {
@@ -141,12 +147,12 @@ function ArenaGameView() {
   // this device already has a commitment stored for it — relevant on
   // remount/reload, since the commitment lives in localStorage, not state.
   useEffect(() => {
-    if (!ARENA_ID) return;
+    if (!ARENA_ID || !address) return;
     setRoundPhase("commit");
     setSelectedChoice(null);
     setCommitTimeExpired(false);
-    setHasCommittedForRound(hasStoredCommitmentForRound(ARENA_ID, currentRound));
-  }, [ARENA_ID, currentRound]);
+    setHasCommittedForRound(hasStoredCommitmentForRound(ARENA_ID, currentRound, address));
+  }, [ARENA_ID, currentRound, address]);
 
   useEffect(() => {
     if (!ARENA_ID || !snapshot) return;
@@ -193,8 +199,34 @@ function ArenaGameView() {
     }
   }, [isConnected, address, updateArenaState]);
 
+  // Deterministic client reconciliation (#1385). After a Soroban transaction
+  // reaches a terminal confirmation state — SUCCESS, REJECTED, or TIMEOUT —
+  // the optimistic client state must converge to the chain's authoritative
+  // state. Resolving the outcome through the shared engine (deduped, with
+  // retry + latency observability) and then re-reading the chain makes that
+  // convergence deterministic for every caller of this page.
+  const reconcileOutcome = useCallback(
+    async (outcome: TransactionOutcome) => {
+      await reconcileTransaction(outcome, { arenaId: ARENA_ID });
+      // Re-read the authoritative chain state so optimistic UI state
+      // (isJoined, hasCommittedForRound, balances) converges to the chain.
+      await updateArenaState();
+      await refreshBalance();
+    },
+    [ARENA_ID, updateArenaState, refreshBalance],
+  );
+
   return (
     <>
+      {!ARENA_ID && (
+        <div className="w-full bg-yellow-900/80 border-b border-yellow-500/60 px-4 py-2 flex items-center gap-3 text-yellow-300 font-pixel text-[10px] tracking-wider">
+          <span className="text-yellow-400 font-bold">⚠ DEMO MODE</span>
+          <span>
+            NEXT_PUBLIC_DEMO_ARENA_ID is not set — showing static placeholder data.
+            Set it to a Stellar contract address (C…) in your .env file to connect to a live arena.
+          </span>
+        </div>
+      )}
       <div className="min-h-screen p-4 md:p-6">
         <div className="max-w-7xl mx-auto">
           {/* Header */}
@@ -236,7 +268,7 @@ function ArenaGameView() {
                   setTxType("JOIN");
                   setTxDetails([
                     { label: "Action", value: "Join Arena" },
-                    { label: "Entry Fee", value: "100 XLM" }, // Example
+                    { label: "Entry Fee", value: `${entryFee ?? 0} XLM` },
                     { label: "Arena ID", value: ARENA_ID },
                   ]);
                   setShowTxModal(true);
@@ -390,7 +422,10 @@ function ArenaGameView() {
               <p className="font-pixel text-3xl text-neon-green">{survivors.current}</p>
               <p className="font-pixel text-sm text-white/40">/{survivors.max}</p>
               <div className="mt-3 h-2 bg-dark-bg">
-                <div className="h-full bg-neon-green w-[12.5%]" />
+                <div
+                  className="h-full bg-neon-green"
+                  style={{ width: `${survivors.max > 0 ? (survivors.current / survivors.max) * 100 : 0}%` }}
+                />
               </div>
             </div>
 
@@ -522,13 +557,13 @@ function ArenaGameView() {
                 ? "Sign & Reveal"
                 : "Sign & Claim"
         }
-        onConfirm={async () => {
+        onConfirm={async ({ onSigned }) => {
           if (!address || !txType) return;
 
           try {
             let tx;
             if (txType === "JOIN") {
-              tx = await buildJoinArenaTransaction(address, ARENA_ID, 100);
+              tx = await buildJoinArenaTransaction(address, ARENA_ID);
             } else if (txType === "COMMIT" && selectedChoice) {
               tx = await buildSubmitCommitmentTransaction(address, ARENA_ID, selectedChoice === "heads" ? "Heads" : "Tails", currentRound);
             } else if (txType === "REVEAL") {
@@ -540,7 +575,28 @@ function ArenaGameView() {
             }
 
             const signedXdr = await signTransaction(tx.toXDR());
-            await submitSignedTransaction(signedXdr);
+            onSigned();
+
+            let outcome: TransactionOutcome;
+            try {
+              const txResult = await submitSignedTransaction(signedXdr);
+              outcome = { status: "SUCCESS", hash: String(txResult.txHash) };
+            } catch (e) {
+              // Map every failure to a deterministic outcome and reconcile in
+              // the background: on REJECTED (chain unchanged) and on TIMEOUT
+              // (may still land) the chain is the authority, so we converge
+              // to it instead of leaving optimistic state in place.
+              outcome = captureTransactionOutcome(e);
+              void reconcileOutcome(outcome).catch((reconcileError) => {
+                console.error("Reconciliation failed:", reconcileError);
+              });
+              throw e;
+            }
+
+            // SUCCESS already confirmed — deterministically converge the
+            // optimistic UI to the chain's authoritative state before
+            // settling the round-scoped side effects below.
+            await reconcileOutcome(outcome);
 
             if (txType === "COMMIT") {
               setHasCommittedForRound(true);
@@ -548,13 +604,11 @@ function ArenaGameView() {
               // Only clear now that the reveal has actually confirmed —
               // clearing earlier would strand the salt if signing was
               // cancelled or submission failed.
-              clearCommitmentForRound(ARENA_ID, currentRound);
+              if (address) {
+                clearCommitmentForRound(ARENA_ID, currentRound, address);
+              }
               setHasCommittedForRound(false);
             }
-
-            // Trigger real-time updates
-            await refreshBalance();
-            await updateArenaState();
 
             setShowTxModal(false);
           } catch (e) {

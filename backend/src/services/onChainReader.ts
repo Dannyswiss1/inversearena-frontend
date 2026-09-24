@@ -2,28 +2,59 @@
  * Read-only Soroban contract client for the Arena contract.
  *
  * Calls view functions via simulateTransaction — no signing required.
- * Used to fetch on-chain game_state() and get_player_count() so the
- * backend status and player count reflect the truth on-chain rather
- * than stale DB rows.
+ * Used to fetch on-chain state so the backend reflects authoritative
+ * on-chain truth rather than re-implementing contract logic in TypeScript.
+ *
+ * Key exports consumed by roundService:
+ *  - getOnChainActivePlayerIds  — alive players after resolve_round (#1098)
+ *  - getOnChainWinner           — single winner address for payouts (#1099)
  */
 
 import { Contract, Keypair, nativeToScVal, scValToNative, xdr } from "@stellar/stellar-sdk";
 // @ts-ignore
 import { rpc } from "@stellar/stellar-sdk";
+import { getStellarConfig } from "../config/stellarConfig";
 const { Server } = rpc;
 
 /** On-chain game states — matches the contract's GameState enum. */
 export type OnChainGameState = "Open" | "InProgress" | "Finished" | "Cancelled";
+
+/**
+ * Raised when an on-chain read fails for a transient/infrastructure reason
+ * (RPC timeout, simulation error, malformed response) as opposed to the
+ * contract legitimately reporting "no value yet".
+ *
+ * Callers MUST NOT convert this into a benign empty/null result: an empty
+ * player list means "everyone was eliminated" and a null winner means "game
+ * still in progress", both of which are irreversible state transitions.
+ */
+export class OnChainReadError extends Error {
+  constructor(
+    readonly functionName: string,
+    readonly contractId: string,
+    override readonly cause?: unknown,
+  ) {
+    super(
+      `On-chain read failed for ${functionName} on ${contractId}: ` +
+        (cause instanceof Error ? cause.message : String(cause)),
+    );
+    this.name = "OnChainReadError";
+  }
+}
 
 let rpcServer: rpc.Server | null = null;
 let sourcePublicKey: string | null = null;
 
 function getRpcServer(): rpc.Server {
   if (!rpcServer) {
-    const url = process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
-    rpcServer = new Server(url, { allowHttp: false });
+    rpcServer = new Server(getStellarConfig().sorobanRpcUrl, { allowHttp: false });
   }
   return rpcServer;
+}
+
+/** Test seam — mirrors the pattern used in arenaService.ts / ledgerClock.ts. */
+export function setRpcServerForTest(server: rpc.Server | null): void {
+  rpcServer = server;
 }
 
 /**
@@ -59,7 +90,7 @@ async function simulateViewCall(
   const contract = new Contract(contractId);
   const tx = new (await import("@stellar/stellar-sdk")).TransactionBuilder(sourceAccount, {
     fee: "100",
-    networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015",
+    networkPassphrase: getStellarConfig().networkPassphrase,
   })
     .addOperation(contract.call(functionName, ...args))
     .setTimeout(60)
@@ -102,6 +133,134 @@ export async function getOnChainGameState(contractId: string): Promise<OnChainGa
 export async function getOnChainPlayerCount(contractId: string): Promise<number> {
   try {
     const result = await simulateViewCall(contractId, "get_player_count");
+    return Number(result as bigint | number);
+  } catch {
+    // If the contract call fails, fall back to 0.
+    return 0;
+  }
+}
+
+/**
+ * Read the on-chain player list for an arena contract.
+ * Returns an array of player wallet addresses.
+ */
+export async function getOnChainPlayers(contractId: string): Promise<string[]> {
+  try {
+    const result = await simulateViewCall(contractId, "get_players");
+    // The contract returns a Vec<Address>; scValToNative converts it to an array of strings.
+    const players = result as string[];
+    return players;
+  } catch {
+    // If the contract call fails, return empty array.
+    return [];
+  }
+}
+
+/**
+ * Read the active player IDs from on-chain after a round has been resolved.
+ *
+ * The arena contract's `get_players` function returns
+ * `Vec<(Address, PlayerState)>` where `PlayerState.active` is the
+ * authoritative alive/eliminated flag set by `resolve_round`. Reading
+ * this list replaces the TypeScript minority-wins re-implementation in
+ * `computeEliminations` (issue #1098).
+ *
+ * @param contractId  Stellar contract ID of the arena (C…)
+ * @param page        Pagination page index passed to `get_players` (0-based)
+ * @returns           Array of on-chain wallet addresses that are still active
+ */
+export async function getOnChainActivePlayerIds(
+  contractId: string,
+  page = 0,
+): Promise<string[]> {
+  try {
+    const pageArg = nativeToScVal(page, { type: "u32" });
+    // get_players returns Vec<(Address, PlayerState)>; scValToNative gives
+    // an array of [address_string, { active, rounds_survived, ... }] tuples.
+    const result = await simulateViewCall(contractId, "get_players", [pageArg]);
+    const entries = result as Array<[string, { active: boolean }]>;
+    return entries
+      .filter(([, state]) => state.active)
+      .map(([addr]) => addr);
+  } catch (error) {
+    // Propagate: callers must not silently swallow this — an empty list
+    // would incorrectly mark all players as eliminated.
+    throw new OnChainReadError("get_players", contractId, error);
+  }
+}
+
+/**
+ * Read the single on-chain winner address for a finished arena game.
+ *
+ * The arena contract stores exactly one winner via `set_winner` inside
+ * `resolve_round` when `survivors <= 1`. This is the authoritative
+ * recipient for the full prize pool (issue #1099).
+ *
+ * @param contractId  Stellar contract ID of the arena (C…)
+ * @returns           The winner's wallet address, or null if not yet set
+ */
+export async function getOnChainWinner(
+  contractId: string,
+): Promise<string | null> {
+  let result: unknown;
+  try {
+    result = await simulateViewCall(contractId, "get_winner");
+  } catch (error) {
+    // A failed read is NOT the same as "no winner yet". Returning null here
+    // would let the round commit as RESOLVED with zero payouts, and
+    // resolveRound's state guard then rejects every retry — stranding the
+    // winner's prize permanently. Surface the failure so the caller can
+    // abort and retry.
+    throw new OnChainReadError("get_winner", contractId, error);
+  }
+  // A successful simulation that yields no value genuinely means the contract
+  // has not called set_winner yet, i.e. the game is still in progress.
+  if (result === null || result === undefined) return null;
+  return String(result);
+}
+
+/** Combined result of a single successful live-on-chain read (#1408). */
+export interface OnChainArenaSnapshot {
+  playerCount: number;
+  gameState: OnChainGameState;
+  yieldAccrued: number;
+}
+
+/**
+ * Read player count, game state, and total yield for an arena in one
+ * all-or-nothing attempt (#1408).
+ *
+ * Unlike getOnChainPlayerCount/getOnChainGameState/getOnChainTotalYield
+ * above, this throws on ANY failure instead of silently defaulting a single
+ * field — arenaStatsService needs to know whether "this batch of on-chain
+ * fields is genuinely live" as one fact, not three independently-defaulting
+ * ones, so it can decide whether to serve a flagged last-verified snapshot
+ * instead of silently mixing live and stale data.
+ */
+export async function getOnChainSnapshotOrThrow(
+  contractId: string,
+  vaultContractId: string,
+): Promise<OnChainArenaSnapshot> {
+  const [playerCountRaw, gameStateRaw, yieldRaw] = await Promise.all([
+    simulateViewCall(contractId, "get_player_count"),
+    simulateViewCall(contractId, "game_state"),
+    simulateViewCall(vaultContractId, "get_total_yield"),
+  ]);
+
+  return {
+    playerCount: Number(playerCountRaw as bigint | number),
+    gameState: String(gameStateRaw) as OnChainGameState,
+    yieldAccrued: Number(yieldRaw as bigint | number),
+  };
+}
+
+/**
+ * Read the total yield accrued from the rwa-adapter vault.
+ * Returns the total yield amount as a number.
+ */
+export async function getOnChainTotalYield(contractId: string): Promise<number> {
+  try {
+    const result = await simulateViewCall(contractId, "get_total_yield");
     return Number(result as bigint | number);
   } catch {
     // If the contract call fails, fall back to 0.

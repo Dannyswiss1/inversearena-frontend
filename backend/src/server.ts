@@ -2,10 +2,10 @@ import "dotenv/config";
 // import { db } from "./db/client";
 import { redis } from "./cache/redisClient";
 import { prisma } from "./db/prisma";
-import { SqlTransactionRepository } from "./repositories/sqlTransactionRepository";
 import { connectDB } from "./db/connection";
 import { MongoTransactionRepository } from "./repositories/mongoTransactionRepository";
 import { validateConfig } from "./config/validate";
+import { getPaymentConfig } from "./config/paymentConfig";
 
 import { PaymentService } from "./services/paymentService";
 import { PaymentWorker } from "./workers/paymentWorker";
@@ -32,7 +32,11 @@ async function main() {
 
   const txQueue = createTxQueue();
   const paymentService = new PaymentService(transactions);
-  const paymentWorker = new PaymentWorker(transactions, paymentService, txQueue);
+  const paymentConfig = getPaymentConfig();
+  const paymentWorker = new PaymentWorker(transactions, paymentService, txQueue, {
+    failedRetryMax: paymentConfig.failedRetryMax,
+    failedRetryBaseMs: paymentConfig.failedRetryBaseMs,
+  });
   startTxReconcilerWorker(paymentService, transactions);
   const adminService = new AdminService();
   const authService = new AuthService();

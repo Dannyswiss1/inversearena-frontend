@@ -19,7 +19,7 @@ import { getOnChainGameState } from "./onChainReader";
 import { getPaymentConfig, type PaymentConfig } from "../config/paymentConfig";
 import type { TransactionRepository } from "../repositories/transactionRepository";
 import { payoutsSuccessTotal } from "../utils/metrics";
-import { CircuitOpenError, getSorobanBreaker, type CircuitBreaker } from "../utils/circuitBreaker";
+import { CircuitOpenError, getSorobanBreaker, resetSorobanBreakerForTest, type CircuitBreaker } from "../utils/circuitBreaker";
 import type {
   BuildPayoutResult,
   CreatePayoutRequest,
@@ -30,6 +30,13 @@ import type {
 const PUBLIC_KEY_REGEX = /^G[A-Z2-7]{55}$/;
 const IDEMPOTENCY_REGEX = /^[a-zA-Z0-9:_-]{8,128}$/;
 const AMOUNT_REGEX = /^\d+(\.\d{0,7})?$/;
+
+const PayoutBreakdownSchema = z.object({
+  principal: z.number().finite().nonnegative(),
+  yieldAmount: z.number().finite().nonnegative(),
+  platformFee: z.number().finite().nonnegative(),
+  dust: z.number().finite().nonnegative(),
+});
 
 const CreatePayoutRequestSchema = z.object({
   payoutId: z.string().trim().min(1).max(128),
@@ -46,6 +53,12 @@ const CreatePayoutRequestSchema = z.object({
     .string()
     .trim()
     .regex(IDEMPOTENCY_REGEX, "Invalid idempotency key format"),
+  // #1407: optional settlement breakdown, populated when the caller (e.g. an
+  // operator submitting a round-settlement payout computed via
+  // roundService.computePayouts) has one. Persisted verbatim — this service
+  // does not recompute or validate it against `amount` beyond basic shape,
+  // since that game-economics logic belongs to whoever produced it.
+  breakdown: PayoutBreakdownSchema.optional(),
 });
 
 export function toStroops(amount: string): string {
@@ -83,6 +96,26 @@ export interface PaymentServiceOptions {
   circuitBreaker?: CircuitBreaker;
 }
 
+/**
+ * Raised when a second payout is attempted for a payout id that already has a
+ * transaction, under a different idempotency key (#1353).
+ */
+export class PayoutConflictError extends Error {
+  readonly status = 409;
+  readonly code = "PAYOUT_ALREADY_EXISTS";
+
+  constructor(
+    readonly payoutId: string,
+    readonly existingIdempotencyKey: string,
+  ) {
+    super(
+      `A payout transaction already exists for payoutId ${payoutId}. ` +
+        "Re-send the original idempotency key to retrieve it rather than creating a second payout.",
+    );
+    this.name = "PayoutConflictError";
+  }
+}
+
 export class PaymentService {
   private readonly config: PaymentConfig;
   private readonly rpcServer: any;
@@ -118,7 +151,7 @@ export class PaymentService {
     return this.breaker.getStats();
   }
 
-  async createPayoutTransaction(input: unknown): Promise<BuildPayoutResult> {
+  async createPayoutTransaction(input: unknown, ownerId?: string | null): Promise<BuildPayoutResult> {
     const request = CreatePayoutRequestSchema.parse(input) as CreatePayoutRequest;
 
     const existing = await this.transactions.findByIdempotencyKey(request.idempotencyKey);
@@ -128,6 +161,21 @@ export class PaymentService {
         transaction: existing,
         unsignedXdr: existing.unsignedXdr,
       };
+    }
+
+    // De-duplicating on the caller-supplied idempotency key alone was not enough
+    // (#1353). A retry after an ambiguous timeout typically generates a *fresh*
+    // key, which sailed past the check above, reserved its own nonce and built a
+    // second, independently-submittable transaction for the same prize — a real
+    // double payment. The payout id is the business identity of the payout, so
+    // it is what uniqueness must be enforced on.
+    //
+    // The database now also carries a unique constraint on payout_id; this check
+    // exists so the caller gets a clear conflict instead of a driver error, and
+    // so the nonce below is never burned on a duplicate.
+    const duplicate = await this.transactions.findByPayoutId(request.payoutId);
+    if (duplicate) {
+      throw new PayoutConflictError(request.payoutId, duplicate.idempotencyKey);
     }
 
     const nonce = await this.transactions.reserveNextNonce(this.config.sourceAccount);
@@ -170,6 +218,11 @@ export class PaymentService {
       createdAt: now,
       updatedAt: now,
       confirmedAt: null,
+      ownerId: ownerId ?? null,
+      principal: request.breakdown?.principal ?? null,
+      yieldAmount: request.breakdown?.yieldAmount ?? null,
+      platformFee: request.breakdown?.platformFee ?? null,
+      dust: request.breakdown?.dust ?? null,
     };
 
     await this.transactions.insert(transaction);
@@ -398,14 +451,7 @@ export class PaymentService {
     }
 
     // distribute_winnings(payout_id: u64, winner: Address, amount: i128)
-    // — contract/payout/src/lib.rs:51. Must stay in lockstep with
-    // buildPreparedTransaction above; see the pinning test in
-    // tests/payment.audit.unit.test.ts.
-    // args[0] = payout_id (skipped in validation — off-chain idempotency is
-    //   enforced via `idempotencyKey`, not this on-chain nonce)
-    // args[1] = winner (destination address)
-    // args[2] = amount
-    const destination = String(scValToNative(args[1]!));
+    const destination = Address.fromScVal(args[1]!).toString();
     if (destination !== transaction.destinationAccount) {
       throw new Error("Signed transaction destination does not match the payout record");
     }
@@ -413,6 +459,23 @@ export class PaymentService {
     if (amount !== transaction.amountStroops) {
       throw new Error("Signed transaction amount does not match the payout record");
     }
+    // args[0] must equal the nonce reserved for this payout record — otherwise a
+    // compromised signer could redirect the on-chain payout_id.
+    const payoutIdArg = scValToNative(args[0]!);
+    if (typeof payoutIdArg !== "bigint" || payoutIdArg !== BigInt(transaction.nonce)) {
+      throw new Error(
+        "Signed transaction payout_id argument does not match the reserved nonce"
+      );
+    }
+  }
+
+  /**
+   * Tears down shared async resources held by this service instance.
+   * Must be called in `afterAll` / `afterEach` hooks in tests to prevent
+   * Jest from reporting open async handles (#1194).
+   */
+  destroy(): void {
+    resetSorobanBreakerForTest();
   }
 
   private async requireTransaction(transactionId: string): Promise<TransactionRecord> {
@@ -440,7 +503,7 @@ export class PaymentService {
       this.config.payoutMethodName,
       nativeToScVal(BigInt(nonce), { type: "u64" }),
       new Address(request.destinationAccount).toScVal(),
-      nativeToScVal(BigInt(amountStroops), { type: "i128" })
+      nativeToScVal(BigInt(amountStroops), { type: "i128" }),
     );
 
     const built = new TransactionBuilder(sourceAccount, {

@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Modal } from "@/components/ui/Modal";
-import { useWallet } from "@/shared-d/hooks/useWallet";
+import { useWallet } from "@/features/wallet/useWallet";
 import { TransactionModal } from "@/components/modals/TransactionModal";
 import { buildCreatePoolTransaction, submitSignedTransaction } from "@/shared-d/utils/stellar-transactions";
 import {
@@ -73,8 +73,13 @@ export function PoolCreationModal({
 
   const getMaxStake = useCallback(() => {
     if (!isConnected) return Infinity;
-    return currency === "XLM" ? balance.xlm : balance.usdc;
-  }, [isConnected, currency, balance]);
+    const rawBalance = currency === "XLM" ? balance.xlm : balance.usdc;
+    // For XLM, subtract the estimated network fee to ensure sufficient balance (#1332)
+    if (currency === "XLM") {
+      return Math.max(0, rawBalance - estimatedFee);
+    }
+    return rawBalance;
+  }, [isConnected, currency, balance, estimatedFee]);
 
   const validateForm = useCallback(() => {
     const numericStake = parseFloat(stakeAmountInput);
@@ -473,8 +478,8 @@ export function PoolCreationModal({
         title="Confirm Pool Creation"
         description="Review transaction details"
         details={txDetails}
-        onConfirm={async () => {
-          if (!address) return;
+        onConfirm={async ({ onSigned }) => {
+          if (!address) throw new Error("Wallet disconnected. Please reconnect and try again.");
           const tx = await buildCreatePoolTransaction(address, {
             stakeAmount,
             currency,
@@ -482,6 +487,7 @@ export function PoolCreationModal({
             arenaCapacity,
           });
           const signedXdr = await signTransaction(tx.toXDR());
+          onSigned();
           await submitSignedTransaction(signedXdr);
           onInitialize?.({
             stakeAmount,
