@@ -10,6 +10,11 @@ export class PayoutsController {
     private readonly transactions: TransactionRepository
   ) {}
 
+  getClaimReadiness = async (req: Request, res: Response): Promise<void> => {
+    const result = await this.paymentService.getClaimReadiness(req.params.arenaId!);
+    res.json(result);
+  };
+
   createPayout = async (req: Request, res: Response): Promise<void> => {
     const result = await this.paymentService.createPayoutTransaction(req.body);
 

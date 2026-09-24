@@ -25,6 +25,8 @@ export interface TransactionRecord {
   createdAt: Date;
   updatedAt: Date;
   confirmedAt?: Date | null;
+  replacesTransactionId?: string | null;
+  replacedByTransactionId?: string | null;
 }
 
 export interface CreatePayoutRequest {

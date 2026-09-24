@@ -26,6 +26,8 @@ const TransactionSchema = new Schema<TransactionDocument>(
     errorMessage: { type: String, default: null },
     attempts: { type: Number, required: true, default: 0 },
     confirmedAt: { type: Date, default: null },
+    replacesTransactionId: { type: String, default: null, index: true },
+    replacedByTransactionId: { type: String, default: null },
   },
   {
     timestamps: true,

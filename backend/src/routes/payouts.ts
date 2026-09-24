@@ -8,6 +8,7 @@ import { SignPayoutBodySchema, TransactionIdParamSchema } from "../validation/re
 export function createPayoutsRouter(controller: PayoutsController, authService: AuthService): Router {
   const router = Router();
 
+  router.get("/claim-readiness/:arenaId", requireAuth(authService), asyncHandler(controller.getClaimReadiness));
   router.post("/", requireAuth(authService), asyncHandler(controller.createPayout));
   router.get("/:id", requireAuth(authService), validateParams(TransactionIdParamSchema), asyncHandler(controller.getPayout));
   router.post(

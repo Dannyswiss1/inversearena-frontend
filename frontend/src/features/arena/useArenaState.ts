@@ -16,6 +16,7 @@ export interface ArenaState {
   hasWon: boolean;
   currentStake: number;
   potentialPayout: number;
+  claimReady: boolean;
   entryFee: number;
   playerCount: number;
 }
@@ -46,6 +47,7 @@ function toArenaState(data: ArenaStateResponse): ArenaState {
     hasWon: data.hasWon,
     currentStake: data.currentStake,
     potentialPayout: data.potentialPayout,
+    claimReady: false,
     entryFee: data.entryFee,
     playerCount: data.playerCount,
   };
@@ -77,6 +79,14 @@ export function useArenaState(arenaId: string): UseArenaStateReturn {
         if (!isMounted.current) return;
 
         const nextState = toArenaState(data);
+        if (nextState.hasWon) {
+          try {
+            const response = await fetch(`/api/payouts/claim-readiness/${encodeURIComponent(arenaId)}`);
+            if (response.ok) nextState.claimReady = ((await response.json()) as { ready: boolean }).ready;
+          } catch {
+            nextState.claimReady = false;
+          }
+        }
         setState(nextState);
         errorCount.current = 0;
         setHealth("connected");
